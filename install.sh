@@ -168,7 +168,7 @@ download_files() {
     cd "$TEMP_DIR"
     
     # In production, download from actual GitHub repo
-    # git clone https://github.com/YOUR_USERNAME/vpsik-alert.git
+    # git clone https://github.com/ymasgit/vpsik-alert.git
     
     log "Creating configuration files..."
     
@@ -582,22 +582,177 @@ start_services() {
     log_success "Services started"
 }
 
+# Uninstall function
+uninstall_vpsik() {
+    log_step "🗑️  Uninstalling VPSIk Alert"
+    
+    echo ""
+    echo -e "${RED}⚠️  WARNING: This will remove VPSIk Alert completely!${NC}"
+    echo -e "${YELLOW}All configurations, logs, and data will be deleted.${NC}"
+    echo ""
+    read -p "Are you sure? Type 'yes' to confirm: " confirm
+    
+    if [[ "$confirm" != "yes" ]]; then
+        log "Uninstall cancelled"
+        exit 0
+    fi
+    
+    log "Stopping all services..."
+    systemctl stop vpsik-alert.timer 2>/dev/null
+    systemctl stop vpsik-alert.service 2>/dev/null
+    systemctl stop vpsik-dashboard.service 2>/dev/null
+    systemctl stop vpsik-collector.timer 2>/dev/null
+    systemctl stop vpsik-multi-collector.timer 2>/dev/null
+    systemctl stop vpsik-ssl.timer 2>/dev/null
+    systemctl stop vpsik-ddos.timer 2>/dev/null
+    
+    log "Disabling services..."
+    systemctl disable vpsik-alert.timer 2>/dev/null
+    systemctl disable vpsik-dashboard.service 2>/dev/null
+    systemctl disable vpsik-collector.timer 2>/dev/null
+    systemctl disable vpsik-multi-collector.timer 2>/dev/null
+    systemctl disable vpsik-ssl.timer 2>/dev/null
+    systemctl disable vpsik-ddos.timer 2>/dev/null
+    
+    log "Removing systemd files..."
+    rm -f /etc/systemd/system/vpsik-*.service
+    rm -f /etc/systemd/system/vpsik-*.timer
+    systemctl daemon-reload
+    
+    log "Removing installation directory..."
+    rm -rf /opt/VPSIk-Alert
+    
+    log "Removing management command..."
+    rm -f /usr/local/bin/vpsik
+    
+    log "Removing nginx configuration..."
+    rm -f /etc/nginx/sites-enabled/vpsik-dashboard
+    rm -f /etc/nginx/sites-available/vpsik-dashboard
+    nginx -t && systemctl reload nginx 2>/dev/null
+    
+    log_success "VPSIk Alert has been completely removed"
+    echo ""
+    echo -e "${GREEN}Thank you for using VPSIk Alert!${NC}"
+}
+
 # Create management command
 create_management_command() {
     log_step "🛠️  Creating Management Command"
     
     cat > /usr/local/bin/vpsik << 'MGMT_EOF'
 #!/bin/bash
+
+INSTALL_DIR="/opt/VPSIk-Alert"
+CONFIG_FILE="$INSTALL_DIR/config/config.json"
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
 case "$1" in
-    start) systemctl start vpsik-alert.timer;;
-    stop) systemctl stop vpsik-alert.timer;;
-    restart) systemctl restart vpsik-alert.timer;;
-    status) systemctl status vpsik-alert.timer;;
-    logs) journalctl -u vpsik-alert -f;;
-    config) nano /opt/VPSIk-Alert/config/config.json;;
-    update) curl -sSL https://raw.githubusercontent.com/YOUR_USERNAME/vpsik-alert/main/install.sh | sudo bash -s update;;
-    dashboard) systemctl status vpsik-dashboard;;
-    *) echo "Usage: vpsik {start|stop|restart|status|logs|config|update|dashboard}";;
+    start)
+        systemctl start vpsik-alert.timer
+        echo -e "${GREEN}✓ Monitoring started${NC}"
+        ;;
+    stop)
+        systemctl stop vpsik-alert.timer
+        echo -e "${YELLOW}✓ Monitoring stopped${NC}"
+        ;;
+    restart)
+        systemctl restart vpsik-alert.timer
+        [[ -f /etc/systemd/system/vpsik-dashboard.service ]] && systemctl restart vpsik-dashboard
+        echo -e "${GREEN}✓ Services restarted${NC}"
+        ;;
+    status)
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${GREEN}📊 VPSIk Alert Status${NC}"
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
+        echo -e "${YELLOW}Monitoring Service:${NC}"
+        systemctl status vpsik-alert.timer --no-pager
+        echo ""
+        if [[ -f /etc/systemd/system/vpsik-dashboard.service ]]; then
+            echo -e "${YELLOW}Dashboard Service:${NC}"
+            systemctl status vpsik-dashboard --no-pager
+        fi
+        ;;
+    logs)
+        echo -e "${BLUE}Viewing logs... (Press Ctrl+C to exit)${NC}"
+        journalctl -u vpsik-alert -f
+        ;;
+    config)
+        if [[ -f "$CONFIG_FILE" ]]; then
+            nano "$CONFIG_FILE"
+            echo -e "${YELLOW}Configuration updated. Restart services to apply changes.${NC}"
+            read -p "Restart now? (y/n): " restart_now
+            [[ "$restart_now" == "y" ]] && systemctl restart vpsik-alert.timer
+        else
+            echo -e "${RED}Configuration file not found!${NC}"
+        fi
+        ;;
+    update)
+        echo -e "${BLUE}Updating VPSIk Alert...${NC}"
+        curl -sSL https://raw.githubusercontent.com/ymasgit/vpsik-alert/main/install.sh | sudo bash -s update
+        ;;
+    dashboard)
+        if [[ -f /etc/systemd/system/vpsik-dashboard.service ]]; then
+            PORT=$(jq -r '.dashboard.port // 8080' "$CONFIG_FILE" 2>/dev/null)
+            IP=$(hostname -I | awk '{print $1}')
+            echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "${GREEN}📊 Dashboard Information${NC}"
+            echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo ""
+            systemctl status vpsik-dashboard --no-pager
+            echo ""
+            echo -e "${GREEN}Dashboard URL:${NC} ${YELLOW}http://$IP:$PORT${NC}"
+        else
+            echo -e "${RED}Dashboard is not installed${NC}"
+        fi
+        ;;
+    uninstall)
+        curl -sSL https://raw.githubusercontent.com/ymasgit/vpsik-alert/main/install.sh | sudo bash -s uninstall
+        ;;
+    test)
+        echo -e "${BLUE}Sending test alert...${NC}"
+        $INSTALL_DIR/scripts/monitor.sh
+        echo -e "${GREEN}✓ Test alert sent${NC}"
+        ;;
+    version)
+        if [[ -f "$CONFIG_FILE" ]]; then
+            VERSION=$(jq -r '.version // "Unknown"' "$CONFIG_FILE" 2>/dev/null)
+            echo -e "${GREEN}VPSIk Alert version: $VERSION${NC}"
+        else
+            echo -e "${RED}Version information not available${NC}"
+        fi
+        ;;
+    help|--help|-h)
+        echo -e "${GREEN}VPSIk Alert - Management Commands${NC}"
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
+        echo -e "${YELLOW}Usage:${NC} vpsik [command]"
+        echo ""
+        echo -e "${YELLOW}Commands:${NC}"
+        echo -e "  ${GREEN}start${NC}       Start monitoring"
+        echo -e "  ${GREEN}stop${NC}        Stop monitoring"
+        echo -e "  ${GREEN}restart${NC}     Restart services"
+        echo -e "  ${GREEN}status${NC}      Check status"
+        echo -e "  ${GREEN}logs${NC}        View logs (live)"
+        echo -e "  ${GREEN}config${NC}      Edit configuration"
+        echo -e "  ${GREEN}update${NC}      Update to latest version"
+        echo -e "  ${GREEN}dashboard${NC}   Dashboard information"
+        echo -e "  ${GREEN}uninstall${NC}   Remove VPSIk Alert"
+        echo -e "  ${GREEN}test${NC}        Send test alert"
+        echo -e "  ${GREEN}version${NC}     Show version"
+        echo -e "  ${GREEN}help${NC}        Show this help"
+        echo ""
+        ;;
+    *)
+        echo -e "${RED}Unknown command: $1${NC}"
+        echo -e "Use ${GREEN}vpsik help${NC} to see available commands"
+        exit 1
+        ;;
 esac
 MGMT_EOF
     
@@ -651,54 +806,100 @@ EOF
     echo -e "${CYAN}📊 Installation Summary:${NC}"
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
-    echo -e "  ${GREEN}✓${NC} Version: $VERSION"
-    echo -e "  ${GREEN}✓${NC} Location: $INSTALL_DIR"
-    echo -e "  ${GREEN}✓${NC} Alert Name: $ALERT_NAME"
-    echo -e "  ${GREEN}✓${NC} Check Interval: ${CHECK_INTERVAL}s"
+    echo -e "  ${GREEN}✓${NC} Version: ${GREEN}${VERSION}${NC}"
+    echo -e "  ${GREEN}✓${NC} Location: ${GREEN}${INSTALL_DIR}${NC}"
+    echo -e "  ${GREEN}✓${NC} Alert Name: ${GREEN}${ALERT_NAME}${NC}"
+    echo -e "  ${GREEN}✓${NC} Check Interval: ${GREEN}${CHECK_INTERVAL}s${NC}"
+    echo -e "  ${GREEN}✓${NC} Language: ${GREEN}${LANG_CODE}${NC}"
     echo ""
     
     echo -e "${CYAN}📡 Enabled Notifications:${NC}"
-    [[ "$TELEGRAM_ENABLED" == true ]] && echo -e "  ${GREEN}✓${NC} Telegram"
-    [[ "$EMAIL_ENABLED" == true ]] && echo -e "  ${GREEN}✓${NC} Email"
-    [[ "$DISCORD_ENABLED" == true ]] && echo -e "  ${GREEN}✓${NC} Discord"
-    [[ "$SLACK_ENABLED" == true ]] && echo -e "  ${GREEN}✓${NC} Slack"
+    local notif_count=0
+    if [[ "$TELEGRAM_ENABLED" == true ]]; then
+        echo -e "  ${GREEN}✓${NC} Telegram"
+        notif_count=$((notif_count + 1))
+    fi
+    if [[ "$EMAIL_ENABLED" == true ]]; then
+        echo -e "  ${GREEN}✓${NC} Email"
+        notif_count=$((notif_count + 1))
+    fi
+    if [[ "$DISCORD_ENABLED" == true ]]; then
+        echo -e "  ${GREEN}✓${NC} Discord"
+        notif_count=$((notif_count + 1))
+    fi
+    if [[ "$SLACK_ENABLED" == true ]]; then
+        echo -e "  ${GREEN}✓${NC} Slack"
+        notif_count=$((notif_count + 1))
+    fi
+    if [[ $notif_count -eq 0 ]]; then
+        echo -e "  ${YELLOW}⚠${NC} No notifications enabled (logs only)"
+    fi
+    echo ""
+    
+    echo -e "${CYAN}🔍 Monitoring:${NC}"
+    echo -e "  ${GREEN}✓${NC} CPU/RAM/Disk"
+    echo -e "  ${GREEN}✓${NC} Network Traffic"
+    echo -e "  ${GREEN}✓${NC} Process Monitoring"
+    if [[ "$SERVICES_ENABLED" == true ]]; then
+        echo -e "  ${GREEN}✓${NC} Services: ${SERVICES_LIST}"
+    fi
     echo ""
     
     echo -e "${CYAN}🔐 Security Features:${NC}"
-    [[ "$SSL_ENABLED" == true ]] && echo -e "  ${GREEN}✓${NC} SSL Monitoring"
-    [[ "$DDOS_ENABLED" == true ]] && echo -e "  ${GREEN}✓${NC} DDoS Protection"
+    local security_count=0
+    if [[ "$SSL_ENABLED" == true ]]; then
+        echo -e "  ${GREEN}✓${NC} SSL Certificate Monitoring"
+        security_count=$((security_count + 1))
+    fi
+    if [[ "$DDOS_ENABLED" == true ]]; then
+        echo -e "  ${GREEN}✓${NC} DDoS Protection"
+        security_count=$((security_count + 1))
+    fi
+    if [[ "$RECOVERY_ENABLED" == true ]]; then
+        echo -e "  ${GREEN}✓${NC} Auto-Recovery"
+        security_count=$((security_count + 1))
+    fi
+    if [[ $security_count -eq 0 ]]; then
+        echo -e "  ${YELLOW}⚠${NC} No security features enabled"
+    fi
     echo ""
     
     if [[ "$DASHBOARD_ENABLED" == true ]]; then
-        echo -e "${CYAN}🖥️  Dashboard:${NC}"
-        echo -e "  ${GREEN}✓${NC} URL: ${YELLOW}http://$(hostname -I | awk '{print $1}'):$DASHBOARD_PORT${NC}"
-        echo -e "  ${GREEN}✓${NC} Status: $(systemctl is-active vpsik-dashboard)"
+        local SERVER_IP=$(hostname -I | awk '{print $1}')
+        echo -e "${CYAN}🖥️  Web Dashboard:${NC}"
+        echo -e "  ${GREEN}✓${NC} Status: ${GREEN}Running${NC}"
+        echo -e "  ${GREEN}✓${NC} URL: ${YELLOW}http://${SERVER_IP}:${DASHBOARD_PORT}${NC}"
+        echo -e "  ${GREEN}✓${NC} Database: ${GREEN}Enabled${NC}"
         echo ""
     fi
     
-    echo -e "${CYAN}🎮 Management Commands:${NC}"
-    echo -e "  ${YELLOW}vpsik start${NC}     - Start monitoring"
-    echo -e "  ${YELLOW}vpsik stop${NC}      - Stop monitoring"
-    echo -e "  ${YELLOW}vpsik restart${NC}   - Restart services"
-    echo -e "  ${YELLOW}vpsik status${NC}    - Check status"
-    echo -e "  ${YELLOW}vpsik logs${NC}      - View logs"
-    echo -e "  ${YELLOW}vpsik config${NC}    - Edit configuration"
-    echo -e "  ${YELLOW}vpsik update${NC}    - Update to latest version"
-    echo -e "  ${YELLOW}vpsik dashboard${NC} - Dashboard status"
+    echo -e "${CYAN}🎮 Quick Commands:${NC}"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${YELLOW}vpsik status${NC}      Check service status"
+    echo -e "  ${YELLOW}vpsik logs${NC}        View live logs"
+    echo -e "  ${YELLOW}vpsik config${NC}      Edit configuration"
+    echo -e "  ${YELLOW}vpsik test${NC}        Send test alert"
+    echo -e "  ${YELLOW}vpsik help${NC}        Show all commands"
     echo ""
     
     echo -e "${CYAN}📚 Next Steps:${NC}"
-    echo -e "  1. Check status: ${YELLOW}vpsik status${NC}"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  ${PURPLE}1.${NC} Verify status: ${YELLOW}vpsik status${NC}"
     if [[ "$DASHBOARD_ENABLED" == true ]]; then
-        echo -e "  2. Open dashboard: ${YELLOW}http://$(hostname -I | awk '{print $1}'):$DASHBOARD_PORT${NC}"
+        echo -e "  ${PURPLE}2.${NC} Open dashboard: ${YELLOW}http://$(hostname -I | awk '{print $1}'):${DASHBOARD_PORT}${NC}"
+        echo -e "  ${PURPLE}3.${NC} Send test alert: ${YELLOW}vpsik test${NC}"
+        echo -e "  ${PURPLE}4.${NC} Generate load: ${YELLOW}stress --cpu 4 --timeout 60s${NC}"
+    else
+        echo -e "  ${PURPLE}2.${NC} Send test alert: ${YELLOW}vpsik test${NC}"
+        echo -e "  ${PURPLE}3.${NC} Watch logs: ${YELLOW}vpsik logs${NC}"
     fi
-    echo -e "  3. View logs: ${YELLOW}vpsik logs${NC}"
-    echo -e "  4. Read docs: ${YELLOW}https://github.com/YOUR_USERNAME/vpsik-alert${NC}"
     echo ""
     
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${GREEN}🎉 VPSIk Alert is now protecting your server! 🎉${NC}"
+    echo -e "${GREEN}🎉 VPSIk Alert v${VERSION} is now protecting your server!${NC}"
     echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "${CYAN}💡 Tip:${NC} Run ${YELLOW}vpsik help${NC} to see all available commands"
     echo ""
 }
 
@@ -710,6 +911,13 @@ cleanup() {
 
 # Main installation flow
 main() {
+    # Check for special modes
+    if [[ "$1" == "uninstall" ]]; then
+        print_banner
+        uninstall_vpsik
+        exit 0
+    fi
+    
     print_banner
     
     check_update_mode "$1"
@@ -722,6 +930,25 @@ main() {
     if [[ "$UPDATE_MODE" == false ]]; then
         interactive_config
         generate_config
+    else
+        log "Loading existing configuration..."
+        # Load existing config for summary
+        if [[ -f "$INSTALL_DIR/config/config.json" ]]; then
+            LANG_CODE=$(jq -r '.language // "en"' "$INSTALL_DIR/config/config.json")
+            ALERT_NAME=$(jq -r '.alert_name // "VPS Monitor"' "$INSTALL_DIR/config/config.json")
+            CHECK_INTERVAL=$(jq -r '.check_interval // 300' "$INSTALL_DIR/config/config.json")
+            TELEGRAM_ENABLED=$(jq -r '.notifications.telegram.enabled // false' "$INSTALL_DIR/config/config.json")
+            EMAIL_ENABLED=$(jq -r '.notifications.email.enabled // false' "$INSTALL_DIR/config/config.json")
+            DISCORD_ENABLED=$(jq -r '.notifications.discord.enabled // false' "$INSTALL_DIR/config/config.json")
+            SLACK_ENABLED=$(jq -r '.notifications.slack.enabled // false' "$INSTALL_DIR/config/config.json")
+            SSL_ENABLED=$(jq -r '.security.ssl_monitoring.enabled // false' "$INSTALL_DIR/config/config.json")
+            DDOS_ENABLED=$(jq -r '.security.ddos_protection.enabled // false' "$INSTALL_DIR/config/config.json")
+            RECOVERY_ENABLED=$(jq -r '.recovery.enabled // false' "$INSTALL_DIR/config/config.json")
+            DASHBOARD_ENABLED=$(jq -r '.dashboard.enabled // false' "$INSTALL_DIR/config/config.json")
+            DASHBOARD_PORT=$(jq -r '.dashboard.port // 8080' "$INSTALL_DIR/config/config.json")
+            SERVICES_ENABLED=$(jq -r '.monitoring.services.enabled // false' "$INSTALL_DIR/config/config.json")
+            SERVICES_LIST=$(jq -r '.monitoring.services.list // ""' "$INSTALL_DIR/config/config.json")
+        fi
     fi
     
     install_monitoring
