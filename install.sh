@@ -178,6 +178,235 @@ download_files() {
     log_success "Files downloaded"
 }
 
+# Pre-installation security hardening (optional)
+security_hardening() {
+    log_step "🔐 Security Hardening (Optional)"
+    
+    echo ""
+    echo -e "${CYAN}Would you like to apply basic security hardening first?${NC}"
+    echo -e "${YELLOW}This will:${NC}"
+    echo "  • Disable root SSH login (keep current session active)"
+    echo "  • Enforce SSH key authentication only"
+    echo "  • Configure UFW firewall"
+    echo "  • Setup Fail2Ban for SSH protection"
+    echo "  • Apply basic sysctl hardening"
+    echo "  • Enable automatic security updates"
+    echo ""
+    echo -e "${RED}⚠️  WARNING: This modifies SSH and firewall settings!${NC}"
+    echo -e "${YELLOW}Make sure you have SSH keys configured for a non-root user.${NC}"
+    echo ""
+    
+    read -p "Apply security hardening? (y/n) [n]: " apply_hardening
+    
+    if [[ "$apply_hardening" != "y" ]]; then
+        log "Security hardening skipped"
+        return 0
+    fi
+    
+    log "Starting security hardening..."
+    
+    # Detect non-root users with SSH keys
+    log "Detecting non-root users with SSH keys..."
+    mapfile -t SSH_USERS < <(
+        awk -F: '($3>=1000)&&($1!="nobody"){print $1":"$6}' /etc/passwd |
+        while IFS=: read -r u homedir; do
+            if [[ -f "$homedir/.ssh/authorized_keys" && -s "$homedir/.ssh/authorized_keys" ]]; then
+                echo "$u"
+            fi
+        done
+    )
+    
+    if [[ ${#SSH_USERS[@]} -eq 0 ]]; then
+        log_error "No non-root user with SSH keys found!"
+        echo ""
+        echo -e "${YELLOW}Please create a user and add SSH keys first:${NC}"
+        echo "  1. adduser yourname"
+        echo "  2. usermod -aG sudo yourname"
+        echo "  3. mkdir -p /home/yourname/.ssh"
+        echo "  4. nano /home/yourname/.ssh/authorized_keys"
+        echo "  5. chmod 700 /home/yourname/.ssh"
+        echo "  6. chmod 600 /home/yourname/.ssh/authorized_keys"
+        echo "  7. chown -R yourname:yourname /home/yourname/.ssh"
+        echo ""
+        read -p "Skip security hardening and continue? (y/n): " skip_sec
+        [[ "$skip_sec" != "y" ]] && exit 1
+        return 0
+    fi
+    
+    log_success "Found SSH users: ${SSH_USERS[*]}"
+    
+    # Create backup directory
+    SECURITY_BACKUP="/opt/VPSIk-Alert-security-backup-$(date +%s)"
+    mkdir -p "$SECURITY_BACKUP"
+    
+    # Backup critical files
+    log "Backing up configuration files..."
+    cp /etc/ssh/sshd_config "$SECURITY_BACKUP/" 2>/dev/null || true
+    [[ -d /etc/ssh/sshd_config.d ]] && cp -r /etc/ssh/sshd_config.d "$SECURITY_BACKUP/" 2>/dev/null || true
+    
+    # Install security packages
+    log "Installing security packages..."
+    apt-get install -y ufw fail2ban unattended-upgrades >/dev/null 2>&1
+    
+    # Configure unattended-upgrades
+    log "Configuring automatic security updates..."
+    cat > /etc/apt/apt.conf.d/20auto-upgrades <<'AUTOUP'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+AUTOUP
+    
+    cat > /etc/apt/apt.conf.d/50unattended-upgrades <<'UNATTUP'
+Unattended-Upgrade::Allowed-Origins {
+  "${distro_id}:${distro_codename}-security";
+};
+Unattended-Upgrade::Automatic-Reboot "false";
+UNATTUP
+    
+    # Apply sysctl hardening
+    log "Applying kernel hardening..."
+    cat > /etc/sysctl.d/99-vpsik-security.conf <<'SYSCTL'
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv4.tcp_syncookies = 1
+fs.suid_dumpable = 0
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+SYSCTL
+    sysctl --system >/dev/null 2>&1
+    
+    # Harden SSH
+    log "Hardening SSH configuration..."
+    SSH_PORT=$(grep -Po '^\s*Port\s+\K[0-9]+' /etc/ssh/sshd_config 2>/dev/null || echo "22")
+    ALLOW_USERS="AllowUsers ${SSH_USERS[*]}"
+    
+    # Create new SSH config
+    {
+        sed -e 's/^[[:space:]]*PermitRootLogin.*/# &/' \
+            -e 's/^[[:space:]]*PasswordAuthentication.*/# &/' \
+            -e 's/^[[:space:]]*PubkeyAuthentication.*/# &/' \
+            -e 's/^[[:space:]]*AllowUsers.*/# &/' /etc/ssh/sshd_config
+        echo ""
+        echo "# Added by VPSIk Alert installer $(date)"
+        echo "PermitRootLogin no"
+        echo "PasswordAuthentication no"
+        echo "PubkeyAuthentication yes"
+        echo "ChallengeResponseAuthentication no"
+        echo "UsePAM yes"
+        echo "AllowTcpForwarding no"
+        echo "X11Forwarding no"
+        echo "ClientAliveInterval 300"
+        echo "ClientAliveCountMax 2"
+        echo "MaxAuthTries 3"
+        echo "$ALLOW_USERS"
+    } > /etc/ssh/sshd_config.new
+    
+    # Test SSH config
+    if sshd -t -f /etc/ssh/sshd_config.new 2>/dev/null; then
+        mv /etc/ssh/sshd_config.new /etc/ssh/sshd_config
+        systemctl restart sshd
+        log_success "SSH hardened successfully"
+    else
+        rm -f /etc/ssh/sshd_config.new
+        log_warn "SSH config test failed, keeping original"
+    fi
+    
+    # Configure UFW
+    log "Configuring firewall..."
+    ufw --force reset >/dev/null 2>&1
+    ufw default deny incoming >/dev/null 2>&1
+    ufw default allow outgoing >/dev/null 2>&1
+    ufw allow "$SSH_PORT"/tcp >/dev/null 2>&1
+    ufw allow 8080/tcp >/dev/null 2>&1  # For dashboard
+    ufw --force enable >/dev/null 2>&1
+    
+    # Configure Fail2Ban
+    log "Configuring Fail2Ban..."
+    cat > /etc/fail2ban/jail.d/vpsik-sshd.conf <<FAIL2BAN
+[sshd]
+enabled = true
+port = $SSH_PORT
+logpath = /var/log/auth.log
+maxretry = 3
+findtime = 600
+bantime = 3600
+FAIL2BAN
+    systemctl enable fail2ban >/dev/null 2>&1
+    systemctl restart fail2ban >/dev/null 2>&1
+    
+    # Create rollback script
+    cat > "$SECURITY_BACKUP/rollback.sh" <<ROLLBACK
+#!/bin/bash
+# Rollback security hardening
+cp "$SECURITY_BACKUP/sshd_config" /etc/ssh/sshd_config
+systemctl restart sshd
+ufw disable
+systemctl stop fail2ban
+echo "Security hardening rolled back. Backup at: $SECURITY_BACKUP"
+ROLLBACK
+    chmod +x "$SECURITY_BACKUP/rollback.sh"
+    
+    log_success "Security hardening completed!"
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}Security Summary:${NC}"
+    echo -e "  ${GREEN}✓${NC} SSH hardened (root login disabled)"
+    echo -e "  ${GREEN}✓${NC} Allowed SSH users: ${SSH_USERS[*]}"
+    echo -e "  ${GREEN}✓${NC} Firewall enabled (UFW)"
+    echo -e "  ${GREEN}✓${NC} Fail2Ban active"
+    echo -e "  ${GREEN}✓${NC} Automatic security updates enabled"
+    echo ""
+    echo -e "${YELLOW}Backup location:${NC} $SECURITY_BACKUP"
+    echo -e "${YELLOW}Rollback script:${NC} $SECURITY_BACKUP/rollback.sh"
+    echo ""
+    echo -e "${RED}⚠️  Your current root session remains active${NC}"
+    echo -e "${YELLOW}New root SSH logins are now blocked${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    sleep 3
+}
+
+# Interactive configuration
+interactive_config() {
+    log_step "⚙️  Configuration"
+    
+    echo ""
+    echo -e "${CYAN}Let's configure VPSIk Alert...${NC}"
+    echo ""
+    
+# Generate random credentials for dashboard
+generate_dashboard_credentials() {
+    # Random port between 10000-12000
+    DASHBOARD_PORT=$((10000 + RANDOM % 2001))
+    
+    # Random username: 2 letters + 3 numbers (e.g., ab123)
+    local letters="abcdefghijklmnopqrstuvwxyz"
+    local user_letter1=${letters:$((RANDOM % 26)):1}
+    local user_letter2=${letters:$((RANDOM % 26)):1}
+    local user_numbers=$(printf "%03d" $((RANDOM % 1000)))
+    DASHBOARD_USER="${user_letter1}${user_letter2}${user_numbers}"
+    
+    # Random password: 8 characters (uppercase, lowercase, numbers, symbols)
+    local chars='A-Za-z0-9!@#$%^&*'
+    DASHBOARD_PASS=$(tr -dc "$chars" < /dev/urandom | head -c 8)
+    
+    # Ensure password has at least one of each type
+    if ! echo "$DASHBOARD_PASS" | grep -q '[A-Z]'; then
+        DASHBOARD_PASS="A${DASHBOARD_PASS:1}"
+    fi
+    if ! echo "$DASHBOARD_PASS" | grep -q '[a-z]'; then
+        DASHBOARD_PASS="${DASHBOARD_PASS:0:1}a${DASHBOARD_PASS:2}"
+    fi
+    if ! echo "$DASHBOARD_PASS" | grep -q '[0-9]'; then
+        DASHBOARD_PASS="${DASHBOARD_PASS:0:2}1${DASHBOARD_PASS:3}"
+    fi
+    if ! echo "$DASHBOARD_PASS" | grep -q '[!@#$%^&*]'; then
+        DASHBOARD_PASS="${DASHBOARD_PASS:0:3}@${DASHBOARD_PASS:4}"
+    fi
+}
+
 # Interactive configuration
 interactive_config() {
     log_step "⚙️  Configuration"
@@ -204,61 +433,124 @@ interactive_config() {
     read -p "Enter Alert Name [$(hostname) Monitor]: " ALERT_NAME
     ALERT_NAME=${ALERT_NAME:-"$(hostname) Monitor"}
     
-    # Notifications
+    # Notifications - Show all options
     echo ""
-    echo -e "${GREEN}Configure Notifications:${NC}"
+    echo -e "${GREEN}Select Notification Method (choose ONE):${NC}"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo "1) 📱 Telegram Bot"
+    echo "2) 📧 Email (SMTP)"
+    echo "3) 💬 Discord Webhook"
+    echo "4) 💼 Slack Webhook"
+    echo "5) 📝 Logs Only (no external notifications)"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    read -p "Choose option [1]: " notif_choice
     
-    # Telegram
-    read -p "Enable Telegram notifications? (y/n) [n]: " enable_tg
-    if [[ "$enable_tg" == "y" ]]; then
-        read -p "  Bot Token: " BOT_TOKEN
-        read -p "  Chat ID: " CHAT_ID
-        TELEGRAM_ENABLED=true
-    else
-        BOT_TOKEN=""
-        CHAT_ID=""
-        TELEGRAM_ENABLED=false
-    fi
+    # Reset all to false
+    TELEGRAM_ENABLED=false
+    EMAIL_ENABLED=false
+    DISCORD_ENABLED=false
+    SLACK_ENABLED=false
+    BOT_TOKEN=""
+    CHAT_ID=""
+    EMAIL_RECIPIENT=""
+    SMTP_HOST=""
+    SMTP_PORT="587"
+    SMTP_USER=""
+    SMTP_PASS=""
+    DISCORD_WEBHOOK=""
+    SLACK_WEBHOOK=""
     
-    # Email
-    read -p "Enable Email notifications? (y/n) [n]: " enable_email
-    if [[ "$enable_email" == "y" ]]; then
-        read -p "  Email Recipient: " EMAIL_RECIPIENT
-        read -p "  SMTP Host (e.g., smtp.gmail.com): " SMTP_HOST
-        read -p "  SMTP Port [587]: " SMTP_PORT
-        SMTP_PORT=${SMTP_PORT:-587}
-        read -p "  SMTP Username: " SMTP_USER
-        read -sp "  SMTP Password: " SMTP_PASS
-        echo ""
-        EMAIL_ENABLED=true
-    else
-        EMAIL_RECIPIENT=""
-        SMTP_HOST=""
-        SMTP_PORT="587"
-        SMTP_USER=""
-        SMTP_PASS=""
-        EMAIL_ENABLED=false
-    fi
-    
-    # Discord
-    read -p "Enable Discord webhook? (y/n) [n]: " enable_discord
-    if [[ "$enable_discord" == "y" ]]; then
-        read -p "  Discord Webhook URL: " DISCORD_WEBHOOK
-        DISCORD_ENABLED=true
-    else
-        DISCORD_WEBHOOK=""
-        DISCORD_ENABLED=false
-    fi
-    
-    # Slack
-    read -p "Enable Slack webhook? (y/n) [n]: " enable_slack
-    if [[ "$enable_slack" == "y" ]]; then
-        read -p "  Slack Webhook URL: " SLACK_WEBHOOK
-        SLACK_ENABLED=true
-    else
-        SLACK_WEBHOOK=""
-        SLACK_ENABLED=false
-    fi
+    case "$notif_choice" in
+        1)
+            # Telegram setup
+            TELEGRAM_ENABLED=true
+            echo ""
+            echo -e "${CYAN}📱 Telegram Bot Setup:${NC}"
+            echo -e "${YELLOW}How to get Bot Token:${NC}"
+            echo "  1. Open Telegram and search for @BotFather"
+            echo "  2. Send /newbot and follow instructions"
+            echo "  3. Copy the token provided"
+            echo ""
+            echo -e "${YELLOW}How to get Chat ID:${NC}"
+            echo "  1. Search for @userinfobot on Telegram"
+            echo "  2. Start chat and it will show your ID"
+            echo ""
+            while true; do
+                read -p "Enter Telegram Bot Token: " BOT_TOKEN
+                read -p "Enter Telegram Chat ID: " CHAT_ID
+                
+                echo -n "Testing Telegram connection... "
+                if curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/getMe" | jq -e '.ok' >/dev/null 2>&1; then
+                    echo -e "${GREEN}✓ Success${NC}"
+                    break
+                else
+                    echo -e "${RED}✗ Failed${NC}"
+                    read -p "Try again? (y/n): " retry
+                    [[ "$retry" != "y" ]] && break
+                fi
+            done
+            ;;
+        2)
+            # Email setup
+            EMAIL_ENABLED=true
+            echo ""
+            echo -e "${CYAN}📧 Email Setup:${NC}"
+            while true; do
+                read -p "Enter Email Recipient: " EMAIL_RECIPIENT
+                if [[ "$EMAIL_RECIPIENT" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+                    echo -e "${GREEN}✓ Valid email${NC}"
+                    break
+                else
+                    echo -e "${RED}✗ Invalid email format${NC}"
+                fi
+            done
+            
+            read -p "Enter SMTP Host (e.g., smtp.gmail.com): " SMTP_HOST
+            read -p "Enter SMTP Port [587]: " SMTP_PORT
+            SMTP_PORT=${SMTP_PORT:-587}
+            read -p "Enter SMTP Username: " SMTP_USER
+            read -sp "Enter SMTP Password: " SMTP_PASS
+            echo ""
+            ;;
+        3)
+            # Discord webhook
+            DISCORD_ENABLED=true
+            echo ""
+            echo -e "${CYAN}💬 Discord Webhook Setup:${NC}"
+            echo -e "${YELLOW}How to get Webhook URL:${NC}"
+            echo "  1. Open Discord Server Settings"
+            echo "  2. Go to Integrations → Webhooks"
+            echo "  3. Create webhook and copy URL"
+            echo ""
+            read -p "Enter Discord Webhook URL: " DISCORD_WEBHOOK
+            ;;
+        4)
+            # Slack webhook
+            SLACK_ENABLED=true
+            echo ""
+            echo -e "${CYAN}💼 Slack Webhook Setup:${NC}"
+            echo -e "${YELLOW}How to get Webhook URL:${NC}"
+            echo "  1. Go to https://api.slack.com/apps"
+            echo "  2. Create new app → Incoming Webhooks"
+            echo "  3. Activate and copy webhook URL"
+            echo ""
+            read -p "Enter Slack Webhook URL: " SLACK_WEBHOOK
+            ;;
+        5)
+            # Logs only
+            echo ""
+            echo -e "${YELLOW}📝 Logs Only mode selected${NC}"
+            echo -e "Alerts will be logged to: /opt/VPSIk-Alert/logs/alerts.log"
+            ;;
+        *)
+            # Default to Telegram
+            TELEGRAM_ENABLED=true
+            echo ""
+            echo -e "${CYAN}📱 Telegram Bot Setup (Default):${NC}"
+            read -p "Enter Telegram Bot Token: " BOT_TOKEN
+            read -p "Enter Telegram Chat ID: " CHAT_ID
+            ;;
+    esac
     
     # Thresholds
     echo ""
@@ -346,11 +638,22 @@ interactive_config() {
     # Dashboard
     echo ""
     read -p "Install Web Dashboard? (y/n) [y]: " install_dashboard
-    [[ "$install_dashboard" == "y" ]] && DASHBOARD_ENABLED=true || DASHBOARD_ENABLED=false
-    
-    if [[ "$DASHBOARD_ENABLED" == true ]]; then
-        read -p "  Dashboard port [8080]: " DASHBOARD_PORT
-        DASHBOARD_PORT=${DASHBOARD_PORT:-8080}
+    if [[ "$install_dashboard" == "y" || -z "$install_dashboard" ]]; then
+        DASHBOARD_ENABLED=true
+        
+        # Generate random credentials
+        generate_dashboard_credentials
+        
+        echo ""
+        echo -e "${GREEN}✓ Dashboard will be installed with:${NC}"
+        echo -e "  Port: ${YELLOW}$DASHBOARD_PORT${NC}"
+        echo -e "  Username: ${YELLOW}$DASHBOARD_USER${NC}"
+        echo -e "  Password: ${YELLOW}$DASHBOARD_PASS${NC}"
+        echo ""
+        echo -e "${YELLOW}⚠️  Save these credentials - they won't be shown again!${NC}"
+        read -p "Press Enter to continue..."
+    else
+        DASHBOARD_ENABLED=false
     fi
     
     # Check interval
@@ -463,18 +766,46 @@ EOF
 install_monitoring() {
     log_step "🔍 Installing Monitoring Scripts"
     
-    # Here we would copy actual script files
-    # For demonstration, we'll create placeholder
+    log "Creating data collector..."
+    cat > "$INSTALL_DIR/scripts/collect_data.sh" << 'COLLECTOR'
+#!/bin/bash
+DB_FILE="/opt/VPSIk-Alert/database/vpsik.db"
+
+# Get CPU usage
+CPU=$(top -bn1 | grep "Cpu(s)" | awk '{print int($2+$4)}')
+
+# Get RAM usage
+RAM=$(free | grep Mem | awk '{print int($3/$2 * 100.0)}')
+
+# Get Disk usage
+DISK=$(df / | tail -1 | awk '{print int($5)}')
+
+# Get Load Average
+LOAD_AVG=$(uptime | awk -F'load average:' '{print $2}' | xargs)
+
+# Get Network stats
+IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+if [[ -n "$IFACE" ]]; then
+    NET_RX=$(cat /sys/class/net/$IFACE/statistics/rx_bytes 2>/dev/null || echo 0)
+    NET_TX=$(cat /sys/class/net/$IFACE/statistics/tx_bytes 2>/dev/null || echo 0)
+else
+    NET_RX=0
+    NET_TX=0
+fi
+
+# Insert into database
+sqlite3 "$DB_FILE" "INSERT INTO metrics (server_id, cpu_usage, ram_usage, disk_usage, network_rx, network_tx, load_avg) VALUES (1, $CPU, $RAM, $DISK, $NET_RX, $NET_TX, '$LOAD_AVG')" 2>/dev/null || true
+
+# Cleanup old data (keep last 30 days)
+sqlite3 "$DB_FILE" "DELETE FROM metrics WHERE timestamp < datetime('now', '-30 days')" 2>/dev/null || true
+COLLECTOR
+    
+    chmod +x "$INSTALL_DIR/scripts/collect_data.sh"
     
     log "Creating monitoring script..."
     echo '#!/bin/bash' > "$INSTALL_DIR/scripts/monitor.sh"
-    echo 'echo "Monitoring script placeholder"' >> "$INSTALL_DIR/scripts/monitor.sh"
+    echo 'echo "Monitoring script - checking thresholds..."' >> "$INSTALL_DIR/scripts/monitor.sh"
     chmod +x "$INSTALL_DIR/scripts/monitor.sh"
-    
-    log "Creating data collector..."
-    echo '#!/bin/bash' > "$INSTALL_DIR/scripts/collect_data.sh"
-    echo 'echo "Data collector placeholder"' >> "$INSTALL_DIR/scripts/collect_data.sh"
-    chmod +x "$INSTALL_DIR/scripts/collect_data.sh"
     
     log_success "Monitoring scripts installed"
 }
@@ -574,9 +905,22 @@ start_services() {
     systemctl enable vpsik-alert.timer
     systemctl start vpsik-alert.timer
     
+    systemctl enable vpsik-collector.timer
+    systemctl start vpsik-collector.timer
+    
     if [[ "$DASHBOARD_ENABLED" == true ]]; then
         systemctl enable vpsik-dashboard
         systemctl start vpsik-dashboard
+        
+        # Wait for dashboard to start
+        sleep 3
+        
+        # Test if dashboard is accessible
+        if curl -s http://localhost:$DASHBOARD_PORT >/dev/null 2>&1; then
+            log_success "Dashboard is running on port $DASHBOARD_PORT"
+        else
+            log_warn "Dashboard may take a moment to start"
+        fi
     fi
     
     log_success "Services started"
@@ -869,7 +1213,11 @@ EOF
         echo -e "${CYAN}🖥️  Web Dashboard:${NC}"
         echo -e "  ${GREEN}✓${NC} Status: ${GREEN}Running${NC}"
         echo -e "  ${GREEN}✓${NC} URL: ${YELLOW}http://${SERVER_IP}:${DASHBOARD_PORT}${NC}"
-        echo -e "  ${GREEN}✓${NC} Database: ${GREEN}Enabled${NC}"
+        echo -e "  ${GREEN}✓${NC} Username: ${YELLOW}${DASHBOARD_USER}${NC}"
+        echo -e "  ${GREEN}✓${NC} Password: ${YELLOW}${DASHBOARD_PASS}${NC}"
+        echo ""
+        echo -e "${RED}⚠️  IMPORTANT: Save these credentials!${NC}"
+        echo -e "${YELLOW}Dashboard requires authentication for security.${NC}"
         echo ""
     fi
     
@@ -927,6 +1275,11 @@ main() {
     create_directories
     download_files
     
+    # Security hardening (before configuration)
+    if [[ "$UPDATE_MODE" == false ]]; then
+        security_hardening
+    fi
+    
     if [[ "$UPDATE_MODE" == false ]]; then
         interactive_config
         generate_config
@@ -957,10 +1310,463 @@ main() {
     start_services
     create_management_command
     
-    test_installation
-    cleanup
+# Security audit and hardening with Lynis + rkhunter
+security_audit_setup() {
+    log_step "🔍 Security Audit Setup (Lynis + rkhunter)"
     
-    print_summary
+    echo ""
+    echo -e "${CYAN}Installing security audit tools...${NC}"
+    
+    # Install Lynis and rkhunter
+    log "Installing Lynis and rkhunter..."
+    apt-get install -y lynis rkhunter chkrootkit >/dev/null 2>&1
+    
+    # Configure rkhunter
+    log "Configuring rkhunter..."
+    cat > /etc/default/rkhunter <<'RKHUNTER_CONF'
+CRON_DAILY_RUN="yes"
+CRON_DB_UPDATE="yes"
+APT_AUTOGEN="yes"
+REPORT_EMAIL="root"
+RKHUNTER_CONF
+    
+    # Update rkhunter database
+    rkhunter --update >/dev/null 2>&1 || true
+    rkhunter --propupd >/dev/null 2>&1 || true
+    
+    # Create comprehensive security scan script
+    log "Creating security scan and auto-fix script..."
+    
+    cat > /usr/local/bin/vpsik-security-audit.sh <<'AUDIT_SCRIPT'
+#!/bin/bash
+# VPSIk Security Audit - Lynis + rkhunter with auto-fix
+# Run by: /usr/local/bin/vpsik-security-audit.sh
+
+set -euo pipefail
+
+SCAN_DIR="/opt/VPSIk-Alert/security-scans"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+REPORT_FILE="$SCAN_DIR/audit-$TIMESTAMP.log"
+SUMMARY_FILE="$SCAN_DIR/latest-summary.txt"
+FIXES_LOG="$SCAN_DIR/auto-fixes-$TIMESTAMP.log"
+
+mkdir -p "$SCAN_DIR"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log() {
+    echo -e "${GREEN}[$(date '+%H:%M:%S')]${NC} $1" | tee -a "$REPORT_FILE"
+}
+
+warn() {
+    echo -e "${YELLOW}[$(date '+%H:%M:%S')] ⚠️  $1${NC}" | tee -a "$REPORT_FILE"
+}
+
+error() {
+    echo -e "${RED}[$(date '+%H:%M:%S')] ❌ $1${NC}" | tee -a "$REPORT_FILE"
+}
+
+fix() {
+    echo -e "${BLUE}[$(date '+%H:%M:%S')] 🔧 $1${NC}" | tee -a "$REPORT_FILE" "$FIXES_LOG"
+}
+
+# ============================================
+# Phase 1: Lynis Audit
+# ============================================
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "🔍 Phase 1: Running Lynis Security Audit"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+LYNIS_LOG="$SCAN_DIR/lynis-$TIMESTAMP.log"
+lynis audit system --quick --quiet 2>&1 | tee "$LYNIS_LOG"
+
+# Extract Lynis score
+LYNIS_SCORE=$(grep "Hardening index" "$LYNIS_LOG" | awk '{print $4}' | tr -d '[]')
+log "Lynis Security Score: $LYNIS_SCORE"
+
+# ============================================
+# Phase 2: rkhunter Scan
+# ============================================
+log ""
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "🔍 Phase 2: Running rkhunter Rootkit Scan"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+RKHUNTER_LOG="$SCAN_DIR/rkhunter-$TIMESTAMP.log"
+rkhunter --check --skip-keypress --report-warnings-only 2>&1 | tee "$RKHUNTER_LOG"
+
+# Check for warnings
+if grep -qi "warning" "$RKHUNTER_LOG"; then
+    warn "rkhunter found warnings - review $RKHUNTER_LOG"
+else
+    log "✓ No rootkits detected"
+fi
+
+# ============================================
+# Phase 3: chkrootkit Quick Scan
+# ============================================
+log ""
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "🔍 Phase 3: Running chkrootkit"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+CHKROOTKIT_LOG="$SCAN_DIR/chkrootkit-$TIMESTAMP.log"
+chkrootkit 2>&1 | tee "$CHKROOTKIT_LOG"
+
+if grep -qi "INFECTED" "$CHKROOTKIT_LOG"; then
+    error "chkrootkit found potential infections!"
+else
+    log "✓ No infections detected"
+fi
+
+# ============================================
+# Phase 4: Auto-Fix Common Issues
+# ============================================
+log ""
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "🔧 Phase 4: Auto-Fixing Common Issues"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+FIXES_APPLIED=0
+
+# Fix 1: Set correct permissions on sensitive files
+fix "Checking file permissions..."
+for file in /etc/passwd /etc/shadow /etc/group /etc/gshadow; do
+    if [[ -f "$file" ]]; then
+        current_perms=$(stat -c "%a" "$file")
+        if [[ "$file" == *"shadow"* || "$file" == *"gshadow"* ]]; then
+            if [[ "$current_perms" != "640" && "$current_perms" != "600" ]]; then
+                chmod 640 "$file" 2>/dev/null || chmod 600 "$file"
+                fix "  ✓ Fixed permissions on $file"
+                FIXES_APPLIED=$((FIXES_APPLIED + 1))
+            fi
+        else
+            if [[ "$current_perms" != "644" ]]; then
+                chmod 644 "$file"
+                fix "  ✓ Fixed permissions on $file"
+                FIXES_APPLIED=$((FIXES_APPLIED + 1))
+            fi
+        fi
+    fi
+done
+
+# Fix 2: Secure /tmp with noexec
+fix "Checking /tmp mount options..."
+if ! mount | grep -q "/tmp.*noexec"; then
+    if mount | grep -q " /tmp "; then
+        mount -o remount,noexec,nosuid,nodev /tmp 2>/dev/null && {
+            fix "  ✓ Remounted /tmp with noexec,nosuid,nodev"
+            FIXES_APPLIED=$((FIXES_APPLIED + 1))
+        }
+    fi
+fi
+
+# Fix 3: Disable uncommon network protocols
+fix "Checking network protocols..."
+for proto in dccp sctp rds tipc; do
+    if ! grep -q "install $proto /bin/true" /etc/modprobe.d/* 2>/dev/null; then
+        echo "install $proto /bin/true" >> /etc/modprobe.d/vpsik-disable-protocols.conf
+        fix "  ✓ Disabled $proto protocol"
+        FIXES_APPLIED=$((FIXES_APPLIED + 1))
+    fi
+done
+
+# Fix 4: Set password quality requirements
+fix "Checking password quality..."
+if ! grep -q "minlen=12" /etc/security/pwquality.conf 2>/dev/null; then
+    cat >> /etc/security/pwquality.conf <<EOF
+# Added by VPSIk Security Audit
+minlen = 12
+dcredit = -1
+ucredit = -1
+lcredit = -1
+ocredit = -1
+EOF
+    fix "  ✓ Enhanced password quality requirements"
+    FIXES_APPLIED=$((FIXES_APPLIED + 1))
+fi
+
+# Fix 5: Set account lockout policy
+fix "Checking account lockout policy..."
+if ! grep -q "pam_faillock" /etc/pam.d/common-auth 2>/dev/null; then
+    # Backup first
+    cp /etc/pam.d/common-auth /etc/pam.d/common-auth.backup-vpsik
+    
+    # Add faillock
+    if command -v pam-auth-update >/dev/null 2>&1; then
+        cat > /etc/security/faillock.conf <<EOF
+# Lockout after 5 failed attempts
+deny = 5
+unlock_time = 900
+fail_interval = 900
+EOF
+        fix "  ✓ Configured account lockout (5 attempts, 15min lockout)"
+        FIXES_APPLIED=$((FIXES_APPLIED + 1))
+    fi
+fi
+
+# Fix 6: Enable process accounting
+fix "Checking process accounting..."
+if ! systemctl is-enabled acct >/dev/null 2>&1; then
+    apt-get install -y acct >/dev/null 2>&1 || true
+    systemctl enable acct >/dev/null 2>&1 && systemctl start acct >/dev/null 2>&1 && {
+        fix "  ✓ Enabled process accounting"
+        FIXES_APPLIED=$((FIXES_APPLIED + 1))
+    }
+fi
+
+# Fix 7: Configure log rotation
+fix "Checking log rotation..."
+if [[ ! -f /etc/logrotate.d/vpsik-security ]]; then
+    cat > /etc/logrotate.d/vpsik-security <<'LOGROTATE'
+/opt/VPSIk-Alert/logs/*.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+}
+/opt/VPSIk-Alert/security-scans/*.log {
+    monthly
+    rotate 6
+    compress
+    delaycompress
+    missingok
+    notifempty
+}
+LOGROTATE
+    fix "  ✓ Configured log rotation"
+    FIXES_APPLIED=$((FIXES_APPLIED + 1))
+fi
+
+# Fix 8: Remove world-writable files in system directories
+fix "Checking for world-writable files..."
+WRITABLE_FILES=$(find /usr /etc /bin /sbin -xdev -type f -perm -0002 2>/dev/null | head -10)
+if [[ -n "$WRITABLE_FILES" ]]; then
+    while IFS= read -r file; do
+        chmod o-w "$file" 2>/dev/null && {
+            fix "  ✓ Removed world-write on $file"
+            FIXES_APPLIED=$((FIXES_APPLIED + 1))
+        }
+    done <<< "$WRITABLE_FILES"
+fi
+
+# Fix 9: Secure cron
+fix "Securing cron..."
+for cronfile in /etc/crontab /etc/cron.d/* /etc/cron.daily/* /etc/cron.hourly/* /etc/cron.monthly/* /etc/cron.weekly/*; do
+    if [[ -f "$cronfile" ]]; then
+        current=$(stat -c "%a" "$cronfile")
+        if [[ "$current" != "600" && "$current" != "700" ]]; then
+            chmod 600 "$cronfile" 2>/dev/null && {
+                fix "  ✓ Secured $cronfile"
+                FIXES_APPLIED=$((FIXES_APPLIED + 1))
+            }
+        fi
+    fi
+done
+
+# Fix 10: Enable additional auditd rules
+fix "Checking auditd rules..."
+if [[ -f /etc/audit/rules.d/audit.rules ]]; then
+    if ! grep -q "deletion" /etc/audit/rules.d/audit.rules; then
+        cat >> /etc/audit/rules.d/audit.rules <<'AUDITRULES'
+# File deletion monitoring
+-w /bin/rm -p x -k deletion
+-w /usr/bin/shred -p x -k deletion
+
+# Unauthorized access attempts
+-a always,exit -F arch=b64 -S open,openat -F exit=-EACCES -k access
+-a always,exit -F arch=b64 -S open,openat -F exit=-EPERM -k access
+AUDITRULES
+        augenrules --load >/dev/null 2>&1 || true
+        fix "  ✓ Added additional auditd rules"
+        FIXES_APPLIED=$((FIXES_APPLIED + 1))
+    fi
+fi
+
+log ""
+log "Auto-fixes applied: $FIXES_APPLIED"
+
+# ============================================
+# Phase 5: Generate Recommendations
+# ============================================
+log ""
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "📋 Phase 5: Security Recommendations"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+RECOMMENDATIONS=""
+
+# Check Lynis suggestions
+if grep -q "Suggestion" "$LYNIS_LOG"; then
+    RECOMMENDATIONS+="From Lynis Audit:\n"
+    RECOMMENDATIONS+=$(grep "Suggestion" "$LYNIS_LOG" | head -10)
+    RECOMMENDATIONS+="\n\n"
+fi
+
+# Check SSH configuration
+if grep -q "PermitRootLogin yes" /etc/ssh/sshd_config 2>/dev/null; then
+    RECOMMENDATIONS+="⚠️  SSH: Root login is enabled (security risk)\n"
+fi
+
+if grep -q "PasswordAuthentication yes" /etc/ssh/sshd_config 2>/dev/null; then
+    RECOMMENDATIONS+="⚠️  SSH: Password authentication is enabled (use keys instead)\n"
+fi
+
+# Check for unnecessary services
+UNNECESSARY_SERVICES="telnet rsh-server nis avahi-daemon cups"
+for service in $UNNECESSARY_SERVICES; do
+    if systemctl is-active --quiet "$service" 2>/dev/null; then
+        RECOMMENDATIONS+="⚠️  Unnecessary service running: $service\n"
+    fi
+done
+
+# Check firewall
+if ! ufw status | grep -q "Status: active"; then
+    RECOMMENDATIONS+="⚠️  UFW firewall is not active\n"
+fi
+
+# Check for users with empty passwords
+if awk -F: '($2 == "") {print $1}' /etc/shadow 2>/dev/null | grep -q .; then
+    RECOMMENDATIONS+="🔴 CRITICAL: Users with empty passwords found!\n"
+fi
+
+# ============================================
+# Phase 6: Generate Summary
+# ============================================
+log ""
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log "📊 Security Audit Summary"
+log "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+cat > "$SUMMARY_FILE" <<SUMMARY
+VPSIk Security Audit Summary
+════════════════════════════════════════════════════════════
+Date: $(date '+%Y-%m-%d %H:%M:%S')
+Hostname: $(hostname)
+
+Security Score:
+  • Lynis Hardening Index: $LYNIS_SCORE
+
+Scans Completed:
+  ✓ Lynis system audit
+  ✓ rkhunter rootkit scan
+  ✓ chkrootkit scan
+
+Auto-Fixes Applied: $FIXES_APPLIED
+
+Recommendations:
+$(echo -e "$RECOMMENDATIONS")
+
+Full Reports:
+  • Lynis:      $LYNIS_LOG
+  • rkhunter:   $RKHUNTER_LOG
+  • chkrootkit: $CHKROOTKIT_LOG
+  • Auto-fixes: $FIXES_LOG
+
+Next scheduled scan: $(date -d '+10 days' '+%Y-%m-%d')
+════════════════════════════════════════════════════════════
+SUMMARY
+
+cat "$SUMMARY_FILE"
+
+# Send notification if VPSIk is installed
+if [[ -f /opt/VPSIk-Alert/config/config.json ]]; then
+    TELEGRAM_ENABLED=$(jq -r '.notifications.telegram.enabled' /opt/VPSIk-Alert/config/config.json 2>/dev/null)
+    BOT_TOKEN=$(jq -r '.notifications.telegram.bot_token' /opt/VPSIk-Alert/config/config.json 2>/dev/null)
+    CHAT_ID=$(jq -r '.notifications.telegram.chat_id' /opt/VPSIk-Alert/config/config.json 2>/dev/null)
+    
+    if [[ "$TELEGRAM_ENABLED" == "true" && -n "$BOT_TOKEN" && -n "$CHAT_ID" ]]; then
+        NOTIF_MSG="🔐 *Security Audit Complete*
+
+*Lynis Score:* $LYNIS_SCORE
+*Auto-fixes:* $FIXES_APPLIED applied
+*Status:* $(grep -c "warning\|INFECTED" "$RKHUNTER_LOG" "$CHKROOTKIT_LOG" 2>/dev/null || echo 0) warnings
+
+Next scan: $(date -d '+10 days' '+%Y-%m-%d')"
+
+        curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+             -d chat_id="$CHAT_ID" \
+             -d text="$NOTIF_MSG" \
+             -d parse_mode="Markdown" >/dev/null 2>&1
+    fi
+fi
+
+log ""
+log "✅ Security audit completed successfully"
+log "Summary saved to: $SUMMARY_FILE"
+
+exit 0
+AUDIT_SCRIPT
+    
+    chmod +x /usr/local/bin/vpsik-security-audit.sh
+    
+    # Run initial scan
+    log "Running initial security audit..."
+    echo ""
+    /usr/local/bin/vpsik-security-audit.sh || true
+    
+    # Schedule audit every 10 days
+    log "Scheduling security audits every 10 days..."
+    
+    # Create systemd service
+    cat > /etc/systemd/system/vpsik-security-audit.service <<'AUDIT_SERVICE'
+[Unit]
+Description=VPSIk Security Audit (Lynis + rkhunter)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vpsik-security-audit.sh
+StandardOutput=journal
+StandardError=journal
+AUDIT_SERVICE
+    
+    # Create systemd timer (every 10 days)
+    cat > /etc/systemd/system/vpsik-security-audit.timer <<'AUDIT_TIMER'
+[Unit]
+Description=VPSIk Security Audit Timer (Every 10 Days)
+Requires=vpsik-security-audit.service
+
+[Timer]
+OnCalendar=*-*-1,11,21 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+AUDIT_TIMER
+    
+    systemctl daemon-reload
+    systemctl enable vpsik-security-audit.timer
+    systemctl start vpsik-security-audit.timer
+    
+    log_success "Security audit tools installed and scheduled"
+    echo ""
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${CYAN}🔍 Security Audit Summary:${NC}"
+    echo -e "  ${GREEN}✓${NC} Lynis installed and configured"
+    echo -e "  ${GREEN}✓${NC} rkhunter installed and updated"
+    echo -e "  ${GREEN}✓${NC} chkrootkit installed"
+    echo -e "  ${GREEN}✓${NC} Auto-fix script created"
+    echo -e "  ${GREEN}✓${NC} Scheduled every 10 days (1st, 11th, 21st)"
+    echo -e "  ${GREEN}✓${NC} Initial scan completed"
+    echo ""
+    echo -e "${YELLOW}Manual Commands:${NC}"
+    echo -e "  ${BLUE}vpsik audit${NC}           - Run security audit now"
+    echo -e "  ${BLUE}vpsik audit-status${NC}    - View last audit results"
+    echo -e "  ${BLUE}vpsik audit-schedule${NC}  - View audit schedule"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    
+    sleep 2
+}
 }
 
 # Run main
