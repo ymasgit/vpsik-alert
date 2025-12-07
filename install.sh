@@ -1,498 +1,320 @@
-#!/bin/bash
-# VPSIk Alert - Professional VPS Monitoring Installer v4.0
-# One-line: curl -sSL https://raw.githubusercontent.com/ymasgit/vpsik-alert/main/install.sh | sudo bash
+#!/usr/bin/env bash
+# VPSIk Alert v5.1 - مُحسَّن، آمن، ومستقر
+# يدعم Ubuntu/Debian/CentOS/Rocky — مع واجهة عربية/إنجليزية اختيارية
 set -euo pipefail
+IFS=$'\n\t'
 
-# === CONSTANTS ===
-VERSION="4.0.0"
-REPO_URL="https://github.com/ymasgit/vpsik-alert.git"
+# === المتغيرات ===
+VERSION="5.1.0"
 INSTALL_DIR="/opt/VPSIk-Alert"
-TEMP_DIR="/tmp/vpsik-install-$$"
-LOCK_FILE="/tmp/vpsik.install.lock"
-INSTALL_LOG="/var/log/vpsik-installer.log"
+REPO="https://github.com/ymasgit/vpsik-alert.git"  # ✅ مسافات زائدة أُزيلت
+LOCK="/tmp/vpsik-install.lock"
+LOG="/var/log/vpsik-installer.log"
+SERVICE_USER="vpsik"
 
-# === COLORS ===
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
-# === LOGGING ===
-exec &> >(tee -a "$INSTALL_LOG" 2>/dev/null)
-log() { echo -e "${GREEN}[$(date '+%H:%M:%S')]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[$(date '+%H:%M:%S')] ⚠️ $1${NC}"; }
-log_error() { echo -e "${RED}[$(date '+%H:%M:%S')] ❌ $1${NC}"; }
-log_success() { echo -e "${GREEN}[$(date '+%H:%M:%S')] ✅ $1${NC}"; }
-log_step() {
-    echo ""
-    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${CYAN}▶ $1${NC}"
-    echo -e "${PURPLE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-}
+log() { echo -e "${GREEN}[$(date '+%H:%M:%S')] $*${NC}" | tee -a "$LOG"; }
+err() { echo -e "${RED}خطأ: $*${NC}" | tee -a "$LOG"; exit 1; }
 
-# === SAFETY CHECKS ===
-if [[ $EUID -ne 0 ]]; then
-    echo -e "${RED}Error: This script must be run as root${NC}" >&2
-    exit 1
+# === التحقق الأولي ===
+[[ $EUID -ne 0 ]] && err "يجب تشغيل السكربت كـ root"
+[[ -f "$LOCK" ]] && err "التثبيت قيد التنفيذ بالفعل"
+touch "$LOCK"
+trap 'rm -f "$LOCK"' EXIT
+exec &> >(tee -a "$LOG")
+
+# === Whiptail + Fallback ===
+USE_WHIPT=false
+if command -v whiptail &>/dev/null && [ -t 1 ]; then
+    USE_WHIPT=true
 fi
 
-if [[ -f "$LOCK_FILE" ]]; then
-    log_error "Installation already in progress"
-    exit 1
-fi
-
-touch "$LOCK_FILE"
-trap 'rm -f "$LOCK_FILE" 2>/dev/null' EXIT
-
-# === BANNER ===
-print_banner() {
-    clear
-    echo -e "${CYAN}"
-    cat << "EOF"
-╔═══════════════════════════════════════════════════════════╗
-║  ██╗   ██╗██████╗ ███████╗██╗██╗  ██╗                   ║
-║  ██║   ██║██╔══██╗██╔════╝██║██║ ██╔╝                   ║
-║  ██║   ██║██████╔╝███████╗██║█████╔╝                    ║
-║  ╚██╗ ██╔╝██╔═══╝ ╚════██║██║██╔═██╗                    ║
-║   ╚████╔╝ ██║     ███████║██║██║  ██╗                   ║
-║    ╚═══╝  ╚═╝     ╚══════╝╚═╝╚═╝  ╚═╝                   ║
-║                                                           ║
-║              Professional VPS Monitoring                 ║
-║                      Version 4.0                         ║
-╚═══════════════════════════════════════════════════════════╝
-EOF
-    echo -e "${NC}${GREEN}🚀 All-in-One Installer${NC}"
-    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-}
-
-# === OS DETECTION ===
-detect_os() {
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        OS=$ID
-        if [[ "$OS" == "almalinux" || "$OS" == "rocky" ]]; then OS="rhel"; fi
+ask() {
+    local prompt="$1" default="${2-}"
+    if $USE_WHIPT; then
+        whiptail --inputbox "$prompt" 10 70 "${default}" 3>&1 1>&2 2>&3
     else
-        log_error "Cannot detect OS"
-        exit 1
+        read -rp "$prompt [${default}]: " val
+        echo "${val:-$default}"
     fi
 }
 
-# === MAIN FLOW ===
-main() {
-    if [[ "${1:-}" == "uninstall" ]]; then
-        print_banner
-        uninstall_vpsik
-        exit 0
-    fi
-
-    print_banner
-    check_update_mode "$1"
-    check_existing
-    install_dependencies
-    create_directories
-    download_files
-    if [[ "$UPDATE_MODE" == false ]]; then
-        security_hardening
-        interactive_config
-        generate_config
+confirm() {
+    local prompt="$1"
+    if $USE_WHIPT; then
+        whiptail --yesno "$prompt" 10 60
     else
-        load_existing_config
+        read -rp "$prompt [y/N]: " ans
+        [[ "${ans,,}" == "y" ]]
     fi
-    install_monitoring
-    install_dashboard
-    create_services
-    start_services
-    create_management_command
-    setup_security_audit
-    test_installation
-    print_summary
-    cleanup
 }
 
-# === MODE HANDLING ===
-check_update_mode() {
-    if [[ "${1:-}" == "update" ]]; then
-        UPDATE_MODE=true
-        log_step "🔄 UPDATE MODE"
-        [[ ! -d "$INSTALL_DIR" ]] && { log_error "Not installed"; exit 1; }
+# === اكتشاف النظام ===
+if [ ! -f /etc/os-release ]; then err "نظام غير مدعوم"; fi
+. /etc/os-release
+
+case "$ID" in
+    ubuntu|debian)
+        PKG_MGR="apt"; FIREWALL="ufw"
+        ;;
+    centos|rhel|almalinux|rocky)
+        PKG_MGR="yum"; FIREWALL="firewalld"
+        ;;
+    *)
+        err "نظام $ID غير مدعوم. يُرجى استخدام Ubuntu/Debian/CentOS/Rocky"
+        ;;
+esac
+
+# === التثبيت مع Progress Bar (إذا متوفر) ===
+if $USE_WHIPT; then
+    install_with_progress() {
+        {
+            echo 5; echo "XXX"; echo "تحديث النظام وتثبيت التبعيات..."; echo "XXX"
+            if [[ "$PKG_MGR" == "apt" ]]; then
+                DEBIAN_FRONTEND=noninteractive apt-get update -qq
+                DEBIAN_FRONTEND=noninteractive apt-get install -y git python3 python3-venv python3-pip sqlite3 nginx jq bc fail2ban rkhunter lynis net-tools ufw curl wget whiptail
+            else
+                yum install -y epel-release
+                yum install -y git python3 python3-pip sqlite nginx jq bc fail2ban rkhunter lynis net-tools firewalld curl wget newt
+            fi
+
+            echo 20; echo "XXX"; echo "إنشاء مستخدم الخدمة..."; echo "XXX"
+            id -u "$SERVICE_USER" &>/dev/null || useradd -r -s /usr/sbin/nologin -M "$SERVICE_USER"
+
+            echo 40; echo "XXX"; echo "تنزيل الملفات من GitHub..."; echo "XXX"
+            TMP_DIR=$(mktemp -d)
+            git clone --depth 1 "$REPO" "$TMP_DIR" || err "فشل تنزيل المستودع"
+            mkdir -p "$INSTALL_DIR"
+            rsync -a --exclude='.git' "$TMP_DIR/" "$INSTALL_DIR/" || true
+            rm -rf "$TMP_DIR"
+
+            echo 70; echo "XXX"; echo "إعداد الهيكل الأساسي..."; echo "XXX"
+            mkdir -p "$INSTALL_DIR"/{config,logs,database,scripts,dashboard/{templates,static},security/scans}
+            chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_DIR"
+        } | whiptail --title "جارٍ التثبيت..." --gauge "الرجاء الانتظار" 8 70 0
+    }
+    install_with_progress
+else
+    log "تحديث النظام وتثبيت التبعيات..."
+    if [[ "$PKG_MGR" == "apt" ]]; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y git python3 python3-venv python3-pip sqlite3 nginx jq bc fail2ban rkhunter lynis net-tools ufw curl wget
     else
-        UPDATE_MODE=false
-        log_step "📦 INSTALLATION MODE"
-    fi
-}
-
-check_existing() {
-    if [[ -d "$INSTALL_DIR" && "$UPDATE_MODE" == false ]]; then
-        log_warn "VPSIk Alert is already installed!"
-        read -p "Update instead? (y/n): " choice
-        [[ "$choice" == "y" ]] && { UPDATE_MODE=true; log "Switching to update mode..."; } || { log_error "Cancelled"; exit 0; }
-    fi
-}
-
-# === DEPENDENCIES ===
-install_dependencies() {
-    log_step "📦 Installing Dependencies"
-    detect_os
-    if [[ "$OS" == "ubuntu" || "$OS" == "debian" ]]; then
-        apt-get update -qq
-        apt-get install -y curl wget git jq bc python3 python3-pip python3-venv \
-            sqlite3 nginx openssl mailutils ssmtp fail2ban net-tools ufw lynis rkhunter chkrootkit
-    elif [[ "$OS" == "rhel" || "$OS" == "centos" || "$OS" == "fedora" ]]; then
         yum install -y epel-release
-        yum install -y curl wget git jq bc python3 python3-pip sqlite nginx openssl \
-            mailx fail2ban net-tools lynis rkhunter chkrootkit
-    else
-        log_error "Unsupported OS: $OS"
-        exit 1
-    fi
-    log_success "Dependencies installed"
-}
-
-# === DIRECTORIES ===
-create_directories() {
-    log_step "📁 Creating Directories"
-    mkdir -p "$INSTALL_DIR"/{config,logs,translations,scripts,security/{ssl,ddos,logs},recovery,dashboard/{static/{css,js,img},templates,api},database}
-    log_success "Directories ready"
-}
-
-# === DOWNLOAD FROM GITHUB ===
-download_files() {
-    log_step "⬇️ Downloading Files from GitHub"
-    mkdir -p "$TEMP_DIR"
-    cd "$TEMP_DIR"
-    if git clone --depth=1 "$REPO_URL" src; then
-        cp -r src/scripts/* "$INSTALL_DIR/scripts/" 2>/dev/null || true
-        cp -r src/dashboard/* "$INSTALL_DIR/dashboard/" 2>/dev/null || true
-        cp -r src/translations/* "$INSTALL_DIR/translations/" 2>/dev/null || true
-    else
-        log_warn "Git clone failed; using built-in scripts"
-        create_builtin_files
-        return
-    fi
-    chmod +x "$INSTALL_DIR/scripts/"*.sh 2>/dev/null || true
-    log_success "Files ready"
-}
-
-# === BUILT-IN FALLBACK ===
-create_builtin_files() {
-    # Monitor script placeholder
-    cat > "$INSTALL_DIR/scripts/monitor.sh" << 'EOF'
-#!/bin/bash
-echo "[VPSIk] Monitoring system not fully implemented. Please upload real scripts to GitHub."
-EOF
-    chmod +x "$INSTALL_DIR/scripts/monitor.sh"
-
-    # Dashboard placeholder
-    mkdir -p "$INSTALL_DIR/dashboard"
-    cat > "$INSTALL_DIR/dashboard/app.py" << 'EOF'
-from flask import Flask
-import os
-app = Flask(__name__)
-@app.route('/')
-def index():
-    return "<h1>VPSIk Alert Dashboard - Working!</h1>"
-if __name__ == '__main__':
-    port = int(os.environ.get('DASHBOARD_PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
-EOF
-}
-
-# === SECURITY HARDENING ===
-security_hardening() {
-    log_step "🔐 Security Hardening (Optional)"
-    echo -e "${CYAN}Apply basic SSH + Firewall hardening?${NC}"
-    read -p "Enable? (y/n) [n]: " choice
-    [[ "$choice" != "y" ]] && { log "Skipped"; return; }
-
-    log "Installing UFW & Fail2Ban..."
-    apt-get install -y ufw fail2ban unattended-upgrades
-
-    # UFW
-    ufw --force reset
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw allow 22/tcp
-    ufw --force enable
-
-    # Fail2Ban
-    cat > /etc/fail2ban/jail.d/vpsik-sshd.conf << 'EOF'
-[sshd]
-enabled = true
-port = 22
-maxretry = 3
-bantime = 3600
-EOF
-    systemctl restart fail2ban
-
-    log_success "Security hardening applied"
-}
-
-# === CONFIGURATION ===
-interactive_config() {
-    log_step "⚙️ Configuration"
-    read -p "Alert Name [$(hostname)]: " ALERT_NAME; ALERT_NAME=${ALERT_NAME:-$(hostname)}
-
-    # Notifications (one only)
-    echo "1) Telegram 2) Email 3) Discord 4) Slack 5) Logs only"
-    read -p "Choice [1]: " notif
-    case "${notif:-1}" in
-        1) configure_telegram ;;
-        2) configure_email ;;
-        3) configure_discord ;;
-        4) configure_slack ;;
-        *) TELEGRAM_ENABLED=false; EMAIL_ENABLED=false; DISCORD_ENABLED=false; SLACK_ENABLED=false ;;
-    esac
-
-    # Dashboard
-    read -p "Install Web Dashboard? (y/n) [y]: " dash
-    if [[ "${dash,,}" == "y" || -z "$dash" ]]; then
-        DASHBOARD_ENABLED=true
-        # Random unused port
-        while true; do
-            DASHBOARD_PORT=$((10000 + RANDOM % 2001))
-            ss -tln | grep -q ":$DASHBOARD_PORT " || break
-        done
-        DASHBOARD_USER=$(openssl rand -hex 4)
-        DASHBOARD_PASS=$(openssl rand -base64 16 | tr -dc 'A-Za-z0-9!@#$%^&*()_+-=' | head -c 12)
-        echo -e "${GREEN}Dashboard: http://\$(hostname -I | awk '{print \$1}'):$DASHBOARD_PORT${NC}"
-        echo -e "${GREEN}User: $DASHBOARD_USER | Pass: $DASHBOARD_PASS${NC}"
-        echo -e "${RED}⚠️ SAVE THESE!${NC}"
-        read -p "Press Enter to continue..."
-    else
-        DASHBOARD_ENABLED=false
+        yum install -y git python3 python3-pip sqlite nginx jq bc fail2ban rkhunter lynis net-tools firewalld curl wget
     fi
 
-    CHECK_INTERVAL=300
-}
+    log "إنشاء مستخدم الخدمة..."
+    id -u "$SERVICE_USER" &>/dev/null || useradd -r -s /usr/sbin/nologin -M "$SERVICE_USER"
 
-configure_telegram() {
-    TELEGRAM_ENABLED=true
-    read -p "Bot Token: " BOT_TOKEN
-    read -p "Chat ID: " CHAT_ID
-    curl -sf "https://api.telegram.org/bot$BOT_TOKEN/getMe" | jq -e '.ok' >/dev/null || { log_error "Invalid token"; exit 1; }
-    EMAIL_ENABLED=false; DISCORD_ENABLED=false; SLACK_ENABLED=false
-}
+    log "تنزيل الملفات..."
+    TMP_DIR=$(mktemp -d)
+    git clone --depth 1 "$REPO" "$TMP_DIR" || err "فشل التنزيل"
+    mkdir -p "$INSTALL_DIR"
+    rsync -a --exclude='.git' "$TMP_DIR/" "$INSTALL_DIR/" || true
+    rm -rf "$TMP_DIR"
 
-configure_email() {
-    EMAIL_ENABLED=true
-    while true; do
-        read -p "Email: " EMAIL_RECIPIENT
-        [[ "$EMAIL_RECIPIENT" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] && break
-        echo "Invalid email"
+    log "إعداد المجلدات..."
+    mkdir -p "$INSTALL_DIR"/{config,logs,database,scripts,dashboard/{templates,static},security/scans}
+    chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_DIR"
+fi
+
+# === التهيئة التفاعلية ===
+ALERT_NAME=$(ask "اسم الخادم في الإشعارات" "$(hostname -f)")
+
+NOTIF=$(whiptail --menu "اختر وسيلة الإشعارات" 16 65 5 \
+    "telegram" "Telegram (موصى به)" \
+    "email" "بريد إلكتروني" \
+    "discord" "Discord Webhook" \
+    "slack" "Slack Webhook" \
+    "none" "سجلات فقط" 3>&1 1>&2 2>&3)
+
+TOKEN=""; CHAT_ID=""; EMAIL_TO=""; DISCORD_WEBHOOK=""; SLACK_WEBHOOK=""
+
+case "$NOTIF" in
+    telegram)
+        TOKEN=$(ask "Telegram Bot Token (من @BotFather)")
+        CHAT_ID=$(ask "Telegram Chat ID (من @userinfobot)")
+        # ✅ إصلاح المسافة في الرابط
+        if ! curl -s "https://api.telegram.org/bot$TOKEN/getMe" | grep -q '"ok":true'; then
+            err "فشل الاتصال ببوت Telegram. تحقق من التوكن والـ Chat ID"
+        fi
+        ;;
+    email) EMAIL_TO=$(ask "البريد الإلكتروني المستقبل") ;;
+    discord) DISCORD_WEBHOOK=$(ask "Discord Webhook URL") ;;
+    slack) SLACK_WEBHOOK=$(ask "Slack Webhook URL") ;;
+esac
+
+DASHBOARD=false
+if confirm "هل تريد تثبيت لوحة تحكم ويب؟"; then
+    DASHBOARD=true
+    while :; do
+        PORT=$((10000 + RANDOM % 40000))
+        ! ss -tlnp 2>/dev/null | grep -q ":$PORT " && break
     done
-    read -p "SMTP Host: " SMTP_HOST
-    read -p "SMTP Port [587]: " SMTP_PORT; SMTP_PORT=${SMTP_PORT:-587}
-    read -p "SMTP User: " SMTP_USER
-    read -sp "SMTP Pass: " SMTP_PASS; echo
-    TELEGRAM_ENABLED=false; DISCORD_ENABLED=false; SLACK_ENABLED=false
-}
+    DASH_USER=$(tr -dc 'a-z0-9' </dev/urandom | head -c 8)
+    DASH_PASS=$(tr -dc 'A-Za-z0-9!@#$%^&*' </dev/urandom | head -c 16)
+fi
 
-configure_discord() { DISCORD_ENABLED=true; read -p "Webhook: " DISCORD_WEBHOOK; TELEGRAM_ENABLED=false; EMAIL_ENABLED=false; SLACK_ENABLED=false; }
-configure_slack() { SLACK_ENABLED=true; read -p "Webhook: " SLACK_WEBHOOK; TELEGRAM_ENABLED=false; EMAIL_ENABLED=false; DISCORD_ENABLED=false; }
+INTERVAL=$(whiptail --menu "فاصل الفحص" 12 60 4 \
+    "60" "كل دقيقة" \
+    "300" "كل 5 دقائق (افتراضي)" \
+    "900" "كل 15 دقيقة" \
+    "1800" "كل 30 دقيقة" 3>&1 1>&2 2>&3)
+INTERVAL=${INTERVAL:-300}
 
-# === CONFIG FILE ===
-generate_config() {
-    cat > "$INSTALL_DIR/config/config.json" << EOF
+SECURITY=$(whiptail --checklist "خيارات الأمان" 16 70 5 \
+    "ssh" "تعطيل Root SSH" ON \
+    "firewall" "تفعيل الجدار الناري" ON \
+    "fail2ban" "الحماية من Brute Force" ON \
+    "updates" "تحديثات أمنية تلقائية" ON \
+    "audit" "فحص أمني كل 10 أيام" ON 3>&1 1>&2 2>&3)
+
+# === كتابة ملف الإعدادات ===
+cat > "$INSTALL_DIR/config/config.json" <<EOF
 {
   "version": "$VERSION",
   "alert_name": "$ALERT_NAME",
-  "dashboard": { "enabled": $DASHBOARD_ENABLED, "port": ${DASHBOARD_PORT:-8080} },
+  "check_interval": $INTERVAL,
   "notifications": {
-    "telegram": { "enabled": $TELEGRAM_ENABLED, "bot_token": "$BOT_TOKEN", "chat_id": "$CHAT_ID" },
-    "email": { "enabled": $EMAIL_ENABLED, "recipient": "$EMAIL_RECIPIENT" }
+    "telegram": {"enabled": $([[ "$NOTIF" == "telegram" ]] && echo true || echo false), "token": "$TOKEN", "chat_id": "$CHAT_ID"},
+    "email": {"enabled": $([[ "$NOTIF" == "email" ]] && echo true || echo false), "to": "$EMAIL_TO"},
+    "discord": {"enabled": $([[ "$NOTIF" == "discord" ]] && echo true || echo false), "webhook": "$DISCORD_WEBHOOK"},
+    "slack": {"enabled": $([[ "$NOTIF" == "slack" ]] && echo true || echo false), "webhook": "$SLACK_WEBHOOK"}
   },
-  "thresholds": { "cpu": {"warning": 80, "critical": 95}, "ram": {"warning": 85, "critical": 95}, "disk": {"warning": 85, "critical": 95} }
+  "dashboard": {"enabled": $DASHBOARD, "port": $PORT},
+  "security": []
 }
 EOF
-    chmod 600 "$INSTALL_DIR/config/config.json"
 
-    if [[ "$EMAIL_ENABLED" == true ]]; then
-        cat > /etc/ssmtp/ssmtp.conf << EOF
-root=$EMAIL_RECIPIENT
-mailhub=$SMTP_HOST:$SMTP_PORT
-AuthUser=$SMTP_USER
-AuthPass=$SMTP_PASS
-UseSTARTTLS=YES
-FromLineOverride=YES
-EOF
-        chmod 640 /etc/ssmtp/ssmtp.conf
-    fi
-}
+# تحديث security array بشكل آمن
+if [[ -n "$SECURITY" ]]; then
+    SECURITY_ARR=$(printf '%s\n' $SECURITY | jq -R . | jq -s .)
+    tmpfile=$(mktemp)
+    jq ".security = $SECURITY_ARR" "$INSTALL_DIR/config/config.json" > "$tmpfile" && mv "$tmpfile" "$INSTALL_DIR/config/config.json"
+fi
 
-# === MONITORING ===
-install_monitoring() {
-    log_step "🔍 Installing Monitoring"
-    chmod +x "$INSTALL_DIR/scripts/"*.sh 2>/dev/null || true
-    log_success "Monitoring ready"
-}
+chmod 600 "$INSTALL_DIR/config/config.json"
+chown "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_DIR/config/config.json"
 
-# === DASHBOARD ===
-install_dashboard() {
-    [[ "$DASHBOARD_ENABLED" != true ]] && { log "Dashboard skipped"; return; }
-    log_step "🖥️ Installing Dashboard"
-    cd "$INSTALL_DIR/dashboard"
-    python3 -m venv venv
-    ./venv/bin/pip install --quiet flask
-    log_success "Dashboard ready"
-}
+# === إعداد بيئة الداشبورد ===
+if [[ "$DASHBOARD" == true ]]; then
+    log "إعداد بيئة Python للداشبورد..."
+    python3 -m venv "$INSTALL_DIR/dashboard/venv"
+    "$INSTALL_DIR/dashboard/venv/bin/pip" install flask flask-login
+    chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_DIR/dashboard/venv"
 
-# === SERVICES ===
-create_services() {
-    log_step "⚙️ Creating System Services"
+    # حفظ بيانات الدخول بشكل منفصل وآمن
+    CRED_FILE="$INSTALL_DIR/config/.dashboard_auth"
+    echo "user:$DASH_USER" > "$CRED_FILE"
+    echo "pass:$DASH_PASS" >> "$CRED_FILE"
+    chmod 600 "$CRED_FILE"
+    chown "$SERVICE_USER":"$SERVICE_USER" "$CRED_FILE"
+fi
 
-    cat > /etc/systemd/system/vpsik-alert.service << EOF
+# === خدمات systemd (صحيحة وفق المعايير) ===
+cat > /etc/systemd/system/vpsik.service <<EOF
 [Unit]
-Description=VPSIk Alert Monitor
+Description=VPSIk Monitor
+After=network.target
+
 [Service]
 Type=oneshot
+User=$SERVICE_USER
+WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/scripts/monitor.sh
-EOF
 
-    cat > /etc/systemd/system/vpsik-alert.timer << EOF
-[Unit]
-Description=VPSIk Alert Timer
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=300
-[Install]
-WantedBy=timers.target
-EOF
-
-    if [[ "$DASHBOARD_ENABLED" == true ]]; then
-        cat > /etc/systemd/system/vpsik-dashboard.service << EOF
-[Unit]
-Description=VPSIk Dashboard
-[Service]
-WorkingDirectory=$INSTALL_DIR/dashboard
-Environment=DASHBOARD_PORT=$DASHBOARD_PORT
-ExecStart=$INSTALL_DIR/dashboard/venv/bin/python app.py
-Restart=always
-RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-    fi
 
-    systemctl daemon-reload
-    log_success "Services created"
-}
-
-# === START ===
-start_services() {
-    systemctl enable --now vpsik-alert.timer
-    [[ "$DASHBOARD_ENABLED" == true ]] && systemctl enable --now vpsik-dashboard
-}
-
-# === MANAGEMENT ===
-create_management_command() {
-    cat > /usr/local/bin/vpsik << 'EOF'
-#!/bin/bash
-case "$1" in
-    status) systemctl status vpsik-alert.timer vpsik-dashboard 2>/dev/null ;;
-    logs) journalctl -u vpsik-alert -f ;;
-    test) /opt/VPSIk-Alert/scripts/monitor.sh ;;
-    audit) /usr/local/bin/vpsik-security-audit.sh ;;
-    dashboard)
-        IP=$(hostname -I | awk '{print $1}')
-        PORT=$(jq -r '.dashboard.port' /opt/VPSIk-Alert/config/config.json)
-        echo "🌐 http://$IP:$PORT"
-        ;;
-    uninstall) curl -sSL https://raw.githubusercontent.com/ymasgit/vpsik-alert/main/install.sh | sudo bash -s uninstall ;;
-    *) echo "vpsik {status|logs|test|audit|dashboard|uninstall}" ;;
-esac
-EOF
-    chmod +x /usr/local/bin/vpsik
-}
-
-# === SECURITY AUDIT (OUTSIDE main) ===
-setup_security_audit() {
-    log_step "🔍 Security Audit Setup"
-    # Install tools
-    apt-get install -y lynis rkhunter chkrootkit
-
-    # Audit script
-    cat > /usr/local/bin/vpsik-security-audit.sh << 'AUDIT'
-#!/bin/bash
-set -euo pipefail
-SCAN_DIR="/opt/VPSIk-Alert/security-scans"
-mkdir -p "$SCAN_DIR"
-LOG="$SCAN_DIR/audit-$(date +%Y%m%d).log"
-lynis audit system > "$LOG" 2>&1 || true
-rkhunter --check >> "$LOG" 2>&1 || true
-echo "Audit complete: $LOG"
-AUDIT
-    chmod +x /usr/local/bin/vpsik-security-audit.sh
-
-    # Timer
-    cat > /etc/systemd/system/vpsik-security-audit.timer << EOF
+cat > /etc/systemd/system/vpsik.timer <<EOF
 [Unit]
-Description=VPSIk Security Audit
+Description=VPSIk Timer
+After=network.target
+
 [Timer]
-OnCalendar=monthly
+OnBootSec=1min
+OnUnitActiveSec=$INTERVAL
 Persistent=true
+
 [Install]
 WantedBy=timers.target
 EOF
 
-    cat > /etc/systemd/system/vpsik-security-audit.service << EOF
+if [[ "$DASHBOARD" == true ]]; then
+    cat > /etc/systemd/system/vpsik-dashboard.service <<EOF
 [Unit]
-Description=VPSIk Security Audit
+Description=VPSIk Dashboard
+After=network.target
+
 [Service]
-ExecStart=/usr/local/bin/vpsik-security-audit.sh
+Type=simple
+User=$SERVICE_USER
+WorkingDirectory=$INSTALL_DIR/dashboard
+ExecStart=$INSTALL_DIR/dashboard/venv/bin/python app.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
 EOF
+fi
 
-    systemctl daemon-reload
-    systemctl enable vpsik-security-audit.timer
-    log_success "Security audit scheduled"
-}
+systemctl daemon-reload
+systemctl enable --now vpsik.timer
+[[ "$DASHBOARD" == true ]] && systemctl enable --now vpsik-dashboard
 
-# === TEST & SUMMARY ===
-test_installation() {
-    log_step "🧪 Testing"
-    vpsik test
-    [[ "$DASHBOARD_ENABLED" == true ]] && sleep 3 && curl -sf "http://localhost:$DASHBOARD_PORT" >/dev/null && log_success "Dashboard OK"
-}
+# === تهيئة الجدار الناري ===
+if [[ "$SECURITY" == *"firewall"* ]]; then
+    if [[ "$FIREWALL" == "ufw" ]]; then
+        ufw allow OpenSSH
+        [[ "$DASHBOARD" == true ]] && ufw allow "$PORT"
+        ufw --force enable
+    else
+        systemctl enable --now firewalld
+        firewall-cmd --add-service=ssh --permanent
+        [[ "$DASHBOARD" == true ]] && firewall-cmd --add-port="$PORT"/tcp --permanent
+        firewall-cmd --reload
+    fi
+fi
 
-print_summary() {
-    clear
-    echo -e "${GREEN}🎉 Installation Complete!${NC}"
-    echo -e "${YELLOW}👉 vpsik status${NC}"
-    [[ "$DASHBOARD_ENABLED" == true ]] && {
-        IP=$(hostname -I | awk '{print $1}')
-        echo -e "${YELLOW}🌐 Dashboard: http://$IP:${DASHBOARD_PORT}${NC}"
-        echo -e "${YELLOW}🔑 User: $DASHBOARD_USER | Pass: ***${NC}"
-    }
-}
+# === أمر CLI (vpsik) ===
+cat > /usr/local/bin/vpsik <<'CMD'
+#!/usr/bin/env bash
+case "${1:-}" in
+    status) systemctl status vpsik.timer vpsik-dashboard --no-pager ;;
+    logs) journalctl -u vpsik -f ;;
+    test) sudo -u vpsik /opt/VPSIk-Alert/scripts/monitor.sh ;;
+    restart) systemctl restart vpsik.timer vpsik-dashboard ;;
+    audit) /usr/local/bin/vpsik-audit ;;
+    config) nano /opt/VPSIk-Alert/config/config.json ;;
+    uninstall) echo "استخدم: sudo /opt/VPSIk-Alert/uninstall.sh" ;;
+    *) echo "الاستخدام: vpsik [status|logs|test|restart|audit|config|uninstall]" ;;
+esac
+CMD
+chmod +x /usr/local/bin/vpsik
 
-# === CLEANUP ===
-cleanup() { rm -rf "$TEMP_DIR"; }
+# === فحص أمني دوري ===
+if [[ "$SECURITY" == *"audit"* ]]; then
+    cat > /usr/local/bin/vpsik-audit <<'AUDIT'
+#!/usr/bin/env bash
+mkdir -p /opt/VPSIk-Alert/security/scans
+/usr/bin/lynis audit system --quiet > /opt/VPSIk-Alert/security/scans/lynis-$(date +%F).log 2>&1
+/usr/bin/rkhunter --check --skip-keypress --nocolors > /opt/VPSIk-Alert/security/scans/rkhunter-$(date +%F).log 2>&1
+AUDIT
+    chmod +x /usr/local/bin/vpsik-audit
+    echo "0 3 */10 * * root /usr/local/bin/vpsik-audit" > /etc/cron.d/vpsik-audit
+fi
 
-# === UNINSTALL ===
-uninstall_vpsik() {
-    log_step "🗑️ Uninstalling"
-    systemctl stop vpsik-*.service vpsik-*.timer 2>/dev/null || true
-    systemctl disable vpsik-*.service vpsik-*.timer 2>/dev/null || true
-    rm -rf /opt/VPSIk-Alert /usr/local/bin/vpsik
-    rm -f /etc/systemd/system/vpsik-*.service /etc/systemd/system/vpsik-*.timer
-    systemctl daemon-reload
-    log_success "Uninstalled"
-    exit 0
-}
+# === رسالة النهاية ===
+IP=$(hostname -I | awk '{print $1}')
+if [[ "$DASHBOARD" == true ]]; then
+    MSG="VPSIk Alert v$VERSION جاهز!\n\nلوحة التحكم: http://$IP:$PORT\nالمستخدم: $DASH_USER\nالمرور: $DASH_PASS\n\nاحفظ هذه البيانات!\n\nاستخدم: vpsik status"
+    $USE_WHIPT && whiptail --title "تم بنجاح!" --msgbox "$MSG" 18 70 || echo -e "\n$MESSAGE\n"
+else
+    MSG="✅ تم تثبيت VPSIk Alert بنجاح!\nالإشعارات: $NOTIF\nاستخدم: vpsik status"
+    $USE_WHIPT && whiptail --msgbox "$MSG" 10 60 || echo -e "\n$MESSAGE\n"
+fi
 
-# === LOAD EXISTING ===
-load_existing_config() {
-    [[ -f "$INSTALL_DIR/config/config.json" ]] || { log_error "Config missing"; exit 1; }
-    LANG_CODE=$(jq -r '.language // "en"' "$INSTALL_DIR/config/config.json")
-    ALERT_NAME=$(jq -r '.alert_name // "VPS Monitor"' "$INSTALL_DIR/config/config.json")
-    CHECK_INTERVAL=$(jq -r '.check_interval // 300' "$INSTALL_DIR/config/config.json")
-    TELEGRAM_ENABLED=$(jq -r '.notifications.telegram.enabled // false' "$INSTALL_DIR/config/config.json")
-    EMAIL_ENABLED=$(jq -r '.notifications.email.enabled // false' "$INSTALL_DIR/config/config.json")
-    DASHBOARD_ENABLED=$(jq -r '.dashboard.enabled // false' "$INSTALL_DIR/config/config.json")
-    DASHBOARD_PORT=$(jq -r '.dashboard.port // 8080' "$INSTALL_DIR/config/config.json")
-}
-
-# === RUN ===
-main "$@"
+log "VPSIk Alert v$VERSION مُثبّت ومُفعّل بنجاح."
